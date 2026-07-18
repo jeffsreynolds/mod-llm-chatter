@@ -17,6 +17,21 @@ from chatter_constants import (
 logger = logging.getLogger(__name__)
 
 
+# OpenAI model capability profiles. Unknown models use
+# legacy/default behavior plus runtime fallback retries.
+OPENAI_MODEL_PROFILES = {
+    # Reasoning/cost-optimized GPT-5.6 Luna profile.
+    # Docs indicate GPT-5.6 family support; this model
+    # currently enforces default temperature behavior in
+    # Chat Completions. Keep compatibility by omitting
+    # temperature and using max_completion_tokens.
+    'gpt-5.6-luna': {
+        'token_param': 'max_completion_tokens',
+        'temperature_mode': 'default_only',
+    },
+}
+
+
 def _split_prompt(prompt):
     """Extract system/user parts from a prompt.
 
@@ -136,6 +151,21 @@ def _effective_max_tokens(provider, config, max_tokens):
     return int(max_tokens * multiplier)
 
 
+def _openai_model_profile(provider, model):
+    """Return a model capability profile for OpenAI models."""
+    if provider != 'openai':
+        return None
+
+    model_id = (model or '').strip().lower()
+    for base_model, profile in OPENAI_MODEL_PROFILES.items():
+        if (
+            model_id == base_model
+            or model_id.startswith(base_model + '-')
+        ):
+            return profile
+    return None
+
+
 def _openai_token_param_name(provider, model, config):
     """Choose max-token parameter name for OpenAI-compatible APIs.
 
@@ -147,6 +177,12 @@ def _openai_token_param_name(provider, model, config):
     )).strip().lower()
     if forced in ('max_tokens', 'max_completion_tokens'):
         return forced
+
+    profile = _openai_model_profile(provider, model)
+    if profile and profile.get('token_param') in (
+        'max_tokens', 'max_completion_tokens'
+    ):
+        return profile['token_param']
 
     # Auto mode: keep compatibility-first defaults for non-OpenAI
     # providers; detect newer OpenAI families by model prefix.
@@ -163,6 +199,20 @@ def _openai_token_param_name(provider, model, config):
         return 'max_completion_tokens'
 
     return 'max_tokens'
+
+
+def _should_send_openai_temperature(
+    provider, model, temperature,
+):
+    """Return whether to include temperature for this model."""
+    profile = _openai_model_profile(provider, model)
+    if not profile:
+        return True
+
+    mode = profile.get('temperature_mode', 'normal')
+    if mode == 'default_only':
+        return False
+    return True
 
 
 def _openai_compatible_create(client, kwargs, label=''):
@@ -189,12 +239,23 @@ def _openai_compatible_create(client, kwargs, label=''):
             retry_kwargs['max_tokens'] = (
                 retry_kwargs.pop('max_completion_tokens')
             )
+        elif (
+            'temperature' in msg
+            and 'temperature' in kwargs
+            and (
+                'unsupported value' in msg
+                or 'does not support' in msg
+                or 'default (1)' in msg
+            )
+        ):
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop('temperature', None)
 
         if retry_kwargs is None:
             raise
 
         logger.info(
-            "Retrying LLM call (%s) with alternate token parameter",
+            "Retrying LLM call (%s) with compatibility fallback parameters",
             label,
         )
         return client.chat.completions.create(**retry_kwargs)
@@ -412,11 +473,14 @@ def call_llm(
             )
             kwargs = {
                 'model': model,
-                'temperature': temperature,
                 'messages': _build_chat_messages(
                     sys_msg, user_msg
                 ),
             }
+            if _should_send_openai_temperature(
+                provider, model, temperature,
+            ):
+                kwargs['temperature'] = temperature
             kwargs[token_param] = request_max_tokens
             if provider == 'google':
                 _apply_google_options(kwargs, config)
@@ -685,22 +749,30 @@ def quick_llm_analyze(
                 response, label
             )
         elif provider in ('openai', 'google', 'openrouter'):
+            req_max = _effective_max_tokens(
+                provider, config, max_tokens
+            )
+            token_param = _openai_token_param_name(
+                provider, model, config,
+            )
             kwargs = {
                 'model': model,
-                'max_tokens': _effective_max_tokens(
-                    provider, config, max_tokens
-                ),
-                'temperature': 0.1,
                 'messages': _build_chat_messages(
                     sys_msg, user_msg
                 ),
             }
+            if _should_send_openai_temperature(
+                provider, model, 0.1,
+            ):
+                kwargs['temperature'] = 0.1
+            kwargs[token_param] = req_max
             if provider == 'google':
                 _apply_google_options(kwargs, config)
             response = (
-                active_client
-                .chat.completions.create(
-                    **kwargs
+                _openai_compatible_create(
+                    active_client,
+                    kwargs,
+                    label=label,
                 )
             )
             result = _extract_chat_content(
