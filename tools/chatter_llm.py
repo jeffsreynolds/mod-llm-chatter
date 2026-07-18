@@ -136,6 +136,70 @@ def _effective_max_tokens(provider, config, max_tokens):
     return int(max_tokens * multiplier)
 
 
+def _openai_token_param_name(provider, model, config):
+    """Choose max-token parameter name for OpenAI-compatible APIs.
+
+    Newer OpenAI model families reject max_tokens and require
+    max_completion_tokens. Legacy models still accept max_tokens.
+    """
+    forced = str(config.get(
+        'LLMChatter.OpenAI.MaxTokensParam', 'auto'
+    )).strip().lower()
+    if forced in ('max_tokens', 'max_completion_tokens'):
+        return forced
+
+    # Auto mode: keep compatibility-first defaults for non-OpenAI
+    # providers; detect newer OpenAI families by model prefix.
+    if provider != 'openai':
+        return 'max_tokens'
+
+    m = (model or '').strip().lower()
+    if (
+        m.startswith('gpt-5')
+        or m.startswith('o1')
+        or m.startswith('o3')
+        or m.startswith('o4')
+    ):
+        return 'max_completion_tokens'
+
+    return 'max_tokens'
+
+
+def _openai_compatible_create(client, kwargs, label=''):
+    """Create chat completion with token-param fallback retry."""
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        msg = str(exc).lower()
+
+        retry_kwargs = None
+        if (
+            'max_completion_tokens' in msg
+            and 'max_tokens' in kwargs
+        ):
+            retry_kwargs = dict(kwargs)
+            retry_kwargs['max_completion_tokens'] = (
+                retry_kwargs.pop('max_tokens')
+            )
+        elif (
+            'max_tokens' in msg
+            and 'max_completion_tokens' in kwargs
+        ):
+            retry_kwargs = dict(kwargs)
+            retry_kwargs['max_tokens'] = (
+                retry_kwargs.pop('max_completion_tokens')
+            )
+
+        if retry_kwargs is None:
+            raise
+
+        logger.info(
+            "Retrying LLM call (%s) with alternate token parameter",
+            label,
+        )
+        return client.chat.completions.create(**retry_kwargs)
+
+
 def _extract_chat_content(response, label=''):
     """Extract text from an OpenAI-compatible chat response."""
     choice = response.choices[0]
@@ -343,18 +407,21 @@ def call_llm(
                 response, label
             )
         elif provider in ('openai', 'google', 'openrouter'):
+            token_param = _openai_token_param_name(
+                provider, model, config,
+            )
             kwargs = {
                 'model': model,
-                'max_tokens': request_max_tokens,
                 'temperature': temperature,
                 'messages': _build_chat_messages(
                     sys_msg, user_msg
                 ),
             }
+            kwargs[token_param] = request_max_tokens
             if provider == 'google':
                 _apply_google_options(kwargs, config)
-            response = client.chat.completions.create(
-                **kwargs
+            response = _openai_compatible_create(
+                client, kwargs, label=label,
             )
             result = _extract_chat_content(
                 response, label

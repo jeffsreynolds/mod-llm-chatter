@@ -495,14 +495,28 @@ def _probe_anthropic(config, model):
 
 def _probe_openai_compatible(client, model):
     """Make a minimal OpenAI-compatible call; text or raises."""
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=5,
-        messages=[{
+    kwargs = {
+        'model': model,
+        'max_tokens': 5,
+        'messages': [{
             'role': 'user',
             'content': 'Reply with the single word: OK',
         }],
-    )
+    }
+    try:
+        resp = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if 'max_completion_tokens' in msg:
+            kwargs['max_completion_tokens'] = (
+                kwargs.pop('max_tokens')
+            )
+            resp = client.chat.completions.create(
+                **kwargs
+            )
+        else:
+            raise
+
     content = resp.choices[0].message.content
     if isinstance(content, str):
         return content.strip()
